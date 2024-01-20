@@ -16,6 +16,7 @@ import torch as th
 from torchvision.transforms import Compose
 import torchvision.transforms.functional as F
 import argparse
+import torch.distributed as dist
 import cv2 
 import os 
 import os.path as osp
@@ -49,10 +50,28 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Object copy and paste')
     parser.add_argument('--coco_root', type=str, help='coco dataset root dir')
     parser.add_argument('--outdir', type=str, help='save dir')
-    parser.add_argument('--model_path', type=str, help='model path', default="stabilityai/stable-diffusion-2-1-base")
+    parser.add_argument('--model_path', type=str, help='model path', required=True)
+    parser.add_argument('--config_path', type=str, help='config path', required=True)
     parser.add_argument('--version', type=str, help='how to fill the blank region in lama', default='bbox')
     args = parser.parse_args()
+    args.local_rank = int(os.environ['LOCAL_RANK'])
+    args.world_size = int(os.environ['WORLD_SIZE'])
+    args.num_workers = 4
     return args
+
+def setup_for_distributed(is_master):
+    """
+    This function disables printing when not in master process
+    """
+    import builtins as __builtin__
+    builtin_print = __builtin__.print
+
+    def print(*args, **kwargs):
+        force = kwargs.pop('force', False)
+        if is_master or force:
+            builtin_print(*args, **kwargs)
+
+    __builtin__.print = print
 
 
 
@@ -131,7 +150,7 @@ def run(args):
     model.to(device)
     for i, (img, targets) in tqdm(enumerate(loader)):
         img, mask, bbox = img, targets
-
+        img_id = None
         # CROP AND TRANSFORM
         """
         center = ((minx+maxx)/2, (miny+maxy)/2)
@@ -155,7 +174,7 @@ def run(args):
         if (args.version == 'noise'):
             raise NotImplementedError
         elif (args.version == 'bbox'):
-            result, guide_mask = recomposite_bbox(batch, transform, model)
+            inpainted, composited, mask, tgt_mask = recomposite_bbox(batch, transform, model)
         elif (args.version == 'zero'):
             raise NotImplementedError
         elif (args.version == 'copy'):
@@ -165,18 +184,12 @@ def run(args):
         else:
             raise AssertionError(f"Invalid method to fill the blank region; got {args.version}")
         
-        
-        for i, guide in enumerate(guide_mask):
-            guide.save(osp.join(out_dir, f"guide_mask{i}", fname))
-        
-    
-
-    
 
 
 if __name__ == "__main__":
-    import pandas as pd 
-
     args = parse_args()
-    df = pd.read_csv(args.anns)
-    run(args, (df, 0))
+    dist.init_process_group(backend='nccl', init_method='env://')
+    rank = dist.get_rank()
+    setup_for_distributed(rank==0)
+
+    run(args)
