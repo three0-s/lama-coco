@@ -17,22 +17,23 @@ from torchvision.transforms.v2 import Compose, ToTensor
 import torchvision.transforms.functional as F
 import argparse
 import torch.distributed as dist
+from einops import repeat
 import cv2 
 import os 
 import os.path as osp
 import pandas as pd 
 from saicinpainting.training.trainers import load_checkpoint
-
+from coco_inpaint_dataset import CoCoInpaintDataset
 import yaml
 from omegaconf import OmegaConf
 from torchvision.utils import save_image
 from torchvision.io import read_image
 import torchvision.transforms as T
-from diffusers import DDIMScheduler
+#from diffusers import DDIMScheduler
 import hashlib
 from typing import Tuple
 from torch.utils.data.distributed import DistributedSampler
-from torchvision.datasets import wrap_dataset_for_transforms_v2
+#from torchvision.datasets import wrap_dataset_for_transforms_v2
 import json 
 
 
@@ -49,6 +50,8 @@ def load_image(image_path, device, ismask=False, is768=False):
 def parse_args():
     parser = argparse.ArgumentParser(description='Object copy and paste')
     parser.add_argument('--coco_root', type=str, help='coco dataset root dir')
+    parser.add_argument('--batch', type=int, help='batch size', default=128)
+    parser.add_argument('--coco_ann_root', type=str, help='coco annotation root dir')
     parser.add_argument('--outdir', type=str, help='save dir')
     parser.add_argument('--model_path', type=str, help='model path', required=True)
     parser.add_argument('--config_path', type=str, help='config path', required=True)
@@ -88,19 +91,19 @@ def recomposite_bbox(batch:th.Tensor, model:th.nn.Module, transform, segm_mask:t
       Return]
         img: Recomposited image with the specified transformation. (numpy.ndarray)
     '''
-    inpainted = model(batch)
+    inpainted = model(batch)['inpainted']
     composited = inpainted.clone()
 
     subj = th.zeros_like(batch['image'])
-    mask = segm_mask.to(th.bool)
-    subj[..., mask] = batch['image'][..., mask]
+    mask = repeat(segm_mask.to(th.bool), 'b 1 h w -> b c h w', c=3)
+    subj[mask] = batch['image'][mask]
     
     subj = transform(subj)
-    tgt_mask = transform(mask.unsqueeze(0)).squeeze(0)
+    tgt_mask = transform(mask)
     
     composited[..., tgt_mask] = subj[..., tgt_mask]
 
-    return inpainted, composited, mask, tgt_mask
+    return inpainted, composited, mask[:, 0, :], tgt_mask[:, 0, :]
 
 
 
@@ -123,73 +126,97 @@ def run(args):
     import os.path as osp
     import os 
     
-    
     from tqdm.auto import tqdm
-
-    
 
     out_dir = args.outdir
     if not osp.exists(out_dir):
         os.makedirs(out_dir)
     
-    dataset = CocoDetection(root=args.coco_root, annFile=osp.join(args.coco_root, "annotations", "instances_val2017.json"), transforms=Compose([ToTensor()]))
-    dataset= wrap_dataset_for_transforms_v2(dataset, target_keys=['boxes', 'masks','image_id'])
+    if 'train' in args.coco_root:
+        dataset = CocoDetection(root=args.coco_root, annFile=osp.join(args.coco_ann_root,  "instances_train2017.json"), transforms=Compose([ToTensor()]))
+    elif 'val' in args.coco_root:   
+        dataset = CocoDetection(root=args.coco_root, annFile=osp.join(args.coco_ann_root,  "instances_val2017.json"), transforms=Compose([ToTensor()]))
+    dataset = CoCoInpaintDataset(dataset)
     sampler = DistributedSampler(dataset) 
     loader = th.utils.data.DataLoader(dataset, 
-                                      batch_size=1, 
+                                      batch_size=args.batch, 
                                       sampler=sampler,
                                       num_workers=args.num_workers//args.world_size,
                                       pin_memory=True,)
-    train_config_path = osp.join(args.config_path)
+    with open(args.config_path, "r") as f:
+        predict_config = OmegaConf.create(yaml.safe_load(f))
+
+    train_config_path = osp.join(predict_config.model.path, 'config.yaml')
     with open(train_config_path, 'r') as f:
         train_config = OmegaConf.create(yaml.safe_load(f))
-        
+    train_config.training_model.predict_only = True
+    train_config.visualizer.kind = 'noop'
+
     model = load_checkpoint(train_config, args.model_path, strict=False, map_location='cpu')
     model.freeze()
     device = th.device(f"cuda:{args.local_rank}") if th.cuda.is_available() else th.device("cpu")
     model.to(device)
     for i, (img, targets) in tqdm(enumerate(loader)):
-        img, mask, bbox = img, targets
-        img_id = None
+        img = img.to(device)
+        img_ids = targets['image_id'].tolist()
+        mask = targets['masks'].to(device)
+        bbox_mask = targets['bbox'].to(device)
+
+        boxes = targets['boxes']
+       
         # CROP AND TRANSFORM
-        """
+        minx = boxes[:, 0].min().item()
+        miny = boxes[:, 1].min().item()
+        maxx = boxes[:, 2].max().item()
+        maxy = boxes[:, 3].max().item()
         center = ((minx+maxx)/2, (miny+maxy)/2)
-        w, h = mask.shape
-        DX = th.randint(-minx, w-maxx, (1,)).item()
-        DY = th.randint(-miny, h-maxy, (1,)).item()
-        # SCALE = th.rand(1).item()*2+0.5
+        w, h = mask.shape[2:]
+        DX = th.randint(-w//4, w//4, (1,)).item()
+        DY = th.randint(-h//4, h//4, (1,)).item()
         SCALE = 1.
         ROTATE = th.randint(-30, 30, (1,)).item()
         transform = ScaleAndShift(DX, DY, SCALE, ROTATE, center=center)
 
-        fname = f'{img}_{mask}_{DX}_{DY}_{SCALE}_{ROTATE}'
+        fname = f'{"_".join(list(map(str, img_ids)))}_{DX}_{DY}_{SCALE}_{ROTATE}'
         m = hashlib.md5()
         m.update(fname.encode('utf-8'))    
         fname = m.hexdigest()[:8] + ".png"
-        """
+        
         # make batch 
-        batch = None 
-        transform = None
+        batch = {'image':img, 'mask':bbox_mask}
 
         if (args.version == 'noise'):
             raise NotImplementedError
         elif (args.version == 'bbox'):
-            inpainted, composited, mask, tgt_mask = recomposite_bbox(batch, transform, model)
+            inpainted, composited, mask, tgt_mask = recomposite_bbox(batch, transform=transform, model=model, segm_mask=mask)
+        
         elif (args.version == 'zero'):
             raise NotImplementedError
         elif (args.version == 'copy'):
             raise NotImplementedError
 
-
         else:
             raise AssertionError(f"Invalid method to fill the blank region; got {args.version}")
-        
-
+        mask = mask.float()
+        tgt_mask = tgt_mask.float()
+        for b in range(img.shape[0]):
+            imgname = str(img_ids[b])+ "_" + str(b)
+            path = osp.join(out_dir, imgname)
+            if not osp.exists(path):
+                os.makedirs(path)
+            
+            save_image(inpainted[b], osp.join(path, "inpainted.png"), nrow=1)
+            save_image(composited[b], osp.join(path, "composited.png"), nrow=1)
+            save_image(mask[b], osp.join(path, "mask.png"), nrow=1)
+            save_image(tgt_mask[b], osp.join(path, "target_mask.png"), nrow=1)
+            save_image(img[b], osp.join(path, "image.png"), nrow=1)
+            with open(osp.join(path, "transformation"), "w") as f:
+                f.write(f"{DX} {DY} {SCALE} {ROTATE}")
 
 if __name__ == "__main__":
     args = parse_args()
     dist.init_process_group(backend='nccl', init_method='env://')
-    rank = dist.get_rank()
-    setup_for_distributed(rank==0)
+    # rank = dist.get_rank()
+    setup_for_distributed(args.local_rank==0)
 
     run(args)

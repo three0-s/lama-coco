@@ -2,7 +2,7 @@ indir: no  # to be overriden in CLI
 outdir: no  # to be overriden in CLI
 
 model:
-  path: no  # to be overriden in CLI
+  path: /workspace/lama-coco/big-lama  # to be overriden in CLI
   checkpoint: best.ckpt
 
 dataset:

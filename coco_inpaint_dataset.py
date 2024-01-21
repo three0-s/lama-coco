@@ -27,8 +27,9 @@ class CoCoInpaintDataset :
         bbox = masks_to_boxes(ann['mask'].unsqueeze(0)).squeeze(0)
         center = bbox[::2].sum()//2, bbox[1::2].sum()//2
         w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        size = int(max(w, h) * 1.5)
+        size = int(max(w, h) * 1.3)+2
         transform = lambda x, center, size: Resize((256, 256))(crop(x, int(center[1]-size//2), int(center[0]-size//2), size, size))
+        
         
         scale = 256 / size
         cx, cy = size//2, size//2 
@@ -37,8 +38,9 @@ class CoCoInpaintDataset :
         mask = transform(ann["mask"].unsqueeze(0), center, size).squeeze(0)
 
         cx, cy, w, h = list(map(lambda x: int(x * scale), [cx, cy, w, h]))
+        w, h = int(w*1.2), int(h*1.2)
         bbox = [cx - w//2, cy - h//2, w, h]
         bbox_mask = th.zeros_like(mask)
         bbox_mask[bbox[1]:bbox[1]+bbox[3], bbox[0]:bbox[0]+bbox[2]] = 1
 
-        return img, {"image_id":ann["image_id"], "bbox": bbox_mask, "masks":mask, "boxes":th.tensor([cx-w//2, cy-h//2, cx+w//2, cy+h//2]).unsqueeze(0)}
+        return img, {"image_id":ann["image_id"], "bbox": bbox_mask.unsqueeze(0), "masks":mask.unsqueeze(0), "boxes":th.tensor([cx-w//2, cy-h//2, cx+w//2, cy+h//2])}

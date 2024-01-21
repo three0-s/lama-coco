@@ -5,7 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
-
+big-lama/
+hub/
 # Distribution / packaging
 .Python
 build/
