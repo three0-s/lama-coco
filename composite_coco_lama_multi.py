@@ -13,7 +13,7 @@
 # ====================================
 
 import torch as th
-from torchvision.transforms import Compose
+from torchvision.transforms.v2 import Compose, ToTensor
 import torchvision.transforms.functional as F
 import argparse
 import cv2 
@@ -113,8 +113,8 @@ def run(args):
     if not osp.exists(out_dir):
         os.makedirs(out_dir)
     
-    dataset = CocoDetection(root=args.coco_root, annFile=osp.join(args.coco_root, "annotations", "instances_val2017.json"), transforms=Compose([PILToTensor()]))
-    dataset= wrap_dataset_for_transforms_v2(dataset, target_keys=['boxes', 'masks'])
+    dataset = CocoDetection(root=args.coco_root, annFile=osp.join(args.coco_root, "annotations", "instances_val2017.json"), transforms=Compose([ToTensor()]))
+    dataset= wrap_dataset_for_transforms_v2(dataset, target_keys=['boxes', 'masks','image_id'])
     sampler = DistributedSampler(dataset) 
     loader = th.utils.data.DataLoader(dataset, 
                                       batch_size=1, 
@@ -130,8 +130,12 @@ def run(args):
     device = th.device(f"cuda:{args.local_rank}") if th.cuda.is_available() else th.device("cpu")
     model.to(device)
     for i, (img, targets) in tqdm(enumerate(loader)):
-        img, mask, bbox = img, targets
-
+        bbox, mask, img_id = targets['boxes'], targets['masks'], targets['image_id']
+        img = img.to(device)
+        bbox = bbox.to(device)
+        mask = mask.to(device)
+        
+        """
         # CROP AND TRANSFORM
         """
         center = ((minx+maxx)/2, (miny+maxy)/2)
