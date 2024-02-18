@@ -13,7 +13,7 @@
 # ====================================
 
 import torch as th
-from torchvision.transforms.v2 import Compose, ToTensor
+from torchvision.transforms.v2 import Compose, ToTensor, GaussianBlur
 import torchvision.transforms.functional as F
 import argparse
 import torch.distributed as dist
@@ -98,8 +98,11 @@ def recomposite_bbox(batch:th.Tensor, model:th.nn.Module, transform, segm_mask:t
     mask = repeat(segm_mask.to(th.bool), 'b 1 h w -> b c h w', c=3)
     subj[mask] = batch['image'][mask]
     
-    subj = transform(subj)
-    tgt_mask = transform(mask)
+    subj = transform[0](subj)
+    subj = transform[1](subj)
+
+    tgt_mask = transform[0](mask)
+    tgt_mask = transform[1](tgt_mask, ismask=True)
     
     composited[..., tgt_mask] = subj[..., tgt_mask]
 
@@ -115,8 +118,19 @@ class ScaleAndShift:
         self.scale=scale
         self.center=center
     
-    def __call__(self, x):
-        img = F.affine(x, self.rotate, (self.dx, self.dy), self.scale, (0, 0), center=self.center)
+    def __call__(self, x:th.Tensor, ismask=False):
+        try:
+            x_tup = x.unbind(0)
+            affine = lambda img, i: F.affine(img.unsqueeze(0), self.rotate, (self.dx[i], self.dy[i]), self.scale, (0, 0), center=self.center, interpolation=F.InterpolationMode.BILINEAR)
+            
+            x_tup = list(map(affine, x_tup, range(len(x_tup))))
+            img = th.cat(x_tup, 0)
+        except TypeError:
+            img = F.affine(x, self.rotate, (self.dx, self.dy), self.scale, (0, 0), center=self.center, interpolation=F.InterpolationMode.BILINEAR)
+        
+        if ismask:
+            img = GaussianBlur(5)(img)
+        
         return img
 
 
@@ -156,28 +170,21 @@ def run(args):
     model.freeze()
     device = th.device(f"cuda:{args.local_rank}") if th.cuda.is_available() else th.device("cpu")
     model.to(device)
-    for i, (img, targets) in tqdm(enumerate(loader)):
+    for i, (img, targets) in tqdm(enumerate(loader), total=len(loader)):
         img = img.to(device)
         img_ids = targets['image_id'].tolist()
         mask = targets['masks'].to(device)
         bbox_mask = targets['bbox'].to(device)
+        dx, dy = targets['translate'].unbind(1)
 
         boxes = targets['boxes']
        
-        # CROP AND TRANSFORM
-        minx = boxes[:, 0].min().item()
-        miny = boxes[:, 1].min().item()
-        maxx = boxes[:, 2].max().item()
-        maxy = boxes[:, 3].max().item()
-        center = ((minx+maxx)/2, (miny+maxy)/2)
-        w, h = mask.shape[2:]
-        DX = th.randint(-w//4, w//4, (1,)).item()
-        DY = th.randint(-h//4, h//4, (1,)).item()
         SCALE = 1.
         ROTATE = th.randint(-30, 30, (1,)).item()
-        transform = ScaleAndShift(DX, DY, SCALE, ROTATE, center=center)
+        transform = [ScaleAndShift(dx, dy, 1, 0),
+                     ScaleAndShift(0, 0, SCALE, ROTATE)]
 
-        fname = f'{"_".join(list(map(str, img_ids)))}_{DX}_{DY}_{SCALE}_{ROTATE}'
+        fname = f'{"_".join(list(map(str, img_ids)))}_{dx}_{dy}_{SCALE}_{ROTATE}'
         m = hashlib.md5()
         m.update(fname.encode('utf-8'))    
         fname = m.hexdigest()[:8] + ".png"
@@ -200,7 +207,7 @@ def run(args):
         mask = mask.float()
         tgt_mask = tgt_mask.float()
         for b in range(img.shape[0]):
-            imgname = str(img_ids[b])+ "_" + str(b)
+            imgname = str(img_ids[b])+ "_" + str(targets['ann_id'][b].cpu().item())
             path = osp.join(out_dir, imgname)
             if not osp.exists(path):
                 os.makedirs(path)
@@ -211,7 +218,7 @@ def run(args):
             save_image(tgt_mask[b], osp.join(path, "target_mask.png"), nrow=1)
             save_image(img[b], osp.join(path, "image.png"), nrow=1)
             with open(osp.join(path, "transformation"), "w") as f:
-                f.write(f"{DX} {DY} {SCALE} {ROTATE}")
+                f.write(f"{dx[b]} {dy[b]} {SCALE} {ROTATE}")
 
 if __name__ == "__main__":
     args = parse_args()

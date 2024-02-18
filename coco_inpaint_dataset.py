@@ -1,17 +1,24 @@
 import torch as th 
-from torchvision.transforms.v2 import Resize
+from torchvision.transforms import Resize, Compose, Lambda
 from torchvision.transforms.functional import crop
 from torchvision.ops import masks_to_boxes
 
 class CoCoInpaintDataset :
-    def __init__(self, coco_dataset):
+    def __init__(self, coco_dataset, res=256):
         self.coco_dataset = coco_dataset
         _ids = self.coco_dataset.ids
         self.img_idxs = []
         self.ann_idxs = []
+        self.res = res
         for i, img_id in enumerate(_ids):
-            ann_num = len(self.coco_dataset.coco.getAnnIds(img_id))
-            for j in range(ann_num):
+            # ann_num = len(self.coco_dataset.coco.getAnnIds(img_id))
+            ann_ids = self.coco_dataset.coco.getAnnIds(img_id)
+            for j, ann_id in enumerate(ann_ids):
+                # check if ann mask is not too small
+                ann = self.coco_dataset.coco.loadAnns(ann_id)[0]
+                mask = th.from_numpy(self.coco_dataset.coco.annToMask(ann))
+                if mask.sum() < 100:
+                    continue
                 self.img_idxs.append(i)
                 self.ann_idxs.append(j)
         
@@ -22,25 +29,29 @@ class CoCoInpaintDataset :
     def __getitem__(self, idx):
         img, ann_tot = self.coco_dataset[self.img_idxs[idx]]
         ann = ann_tot[self.ann_idxs[idx]]
-        ann['mask'] = th.from_numpy(self.coco_dataset.coco.annToMask(ann))
-        
-        bbox = masks_to_boxes(ann['mask'].unsqueeze(0)).squeeze(0)
-        center = bbox[::2].sum()//2, bbox[1::2].sum()//2
+        mask = th.from_numpy(self.coco_dataset.coco.annToMask(ann))
+        assert mask.shape == img.shape[1:], f"Mask shape {mask.shape} does not match image shape {img.shape[1:]}"
+        bbox = masks_to_boxes(mask.unsqueeze(0)).squeeze(0)
+        cx, cy = bbox[::2].sum()//2, bbox[1::2].sum()//2
         w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        size = int(max(w, h) * 1.3)+2
-        transform = lambda x, center, size: Resize((256, 256))(crop(x, int(center[1]-size//2), int(center[0]-size//2), size, size))
-        
-        
-        scale = 256 / size
-        cx, cy = size//2, size//2 
-        
-        img = transform(img, center, size)
-        mask = transform(ann["mask"].unsqueeze(0), center, size).squeeze(0)
 
-        cx, cy, w, h = list(map(lambda x: int(x * scale), [cx, cy, w, h]))
-        w, h = int(w*1.2), int(h*1.2)
-        bbox = [cx - w//2, cy - h//2, w, h]
+        size = int(max(w, h).item() * 2)
+        x_r = int(size//2 - w//2)
+        x_l = int(w//2 - size//2)
+        y_r = int(size//2 - h//2)
+        y_l = int(h//2 - size//2)
+        dx, dy = th.randint(x_l, x_r, (1,)).item(), th.randint(y_l, y_r, (1,)).item()
+        
+        transform = Compose([
+            Lambda(lambda x: crop(x, int(cy+dy)-size//2, int(cx+dx)-size//2, size, size)),
+            Resize((self.res, self.res))
+
+        ])
+        scale = self.res/size
+        img = transform(img)
+        mask = transform(mask.unsqueeze(0)).squeeze(0)
+        bbox = masks_to_boxes(mask.unsqueeze(0)).squeeze(0)
         bbox_mask = th.zeros_like(mask)
-        bbox_mask[bbox[1]:bbox[1]+bbox[3], bbox[0]:bbox[0]+bbox[2]] = 1
+        bbox_mask[int(bbox[1]):int(bbox[3]), int(bbox[0]):int(bbox[2])] = 1
 
-        return img, {"image_id":ann["image_id"], "bbox": bbox_mask.unsqueeze(0), "masks":mask.unsqueeze(0), "boxes":th.tensor([cx-w//2, cy-h//2, cx+w//2, cy+h//2])}
+        return img, {"image_id":ann["image_id"], "ann_id":ann['id'], "bbox": bbox_mask.unsqueeze(0), "masks":mask.unsqueeze(0), "boxes":bbox, "translate":th.tensor([dx*scale, dy*scale])}
