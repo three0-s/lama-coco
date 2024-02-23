@@ -3,7 +3,7 @@ from torchvision.transforms import Resize, Compose, Lambda
 from torchvision.transforms.functional import crop
 from torchvision.ops import masks_to_boxes
 
-class CoCoInpaintDataset :
+class CoCoHarmonizeDataset :
     def __init__(self, coco_dataset, res=256):
         self.coco_dataset = coco_dataset
         _ids = self.coco_dataset.ids
@@ -15,10 +15,10 @@ class CoCoInpaintDataset :
             ann_ids = self.coco_dataset.coco.getAnnIds(img_id)
             for j, ann_id in enumerate(ann_ids):
                 # check if ann mask is not too small
-                ann = self.coco_dataset.coco.loadAnns(ann_id)[0]
-                mask = th.from_numpy(self.coco_dataset.coco.annToMask(ann))
-                if mask.sum() < 100:
-                    continue
+                # ann = self.coco_dataset.coco.loadAnns(ann_id)[0]
+                # mask = th.from_numpy(self.coco_dataset.coco.annToMask(ann))
+                # if mask.sum() < 100:
+                #     continue
                 self.img_idxs.append(i)
                 self.ann_idxs.append(j)
         
@@ -43,7 +43,7 @@ class CoCoInpaintDataset :
         dx, dy = th.randint(x_l, x_r, (1,)).item(), th.randint(y_l, y_r, (1,)).item()
         
         transform = Compose([
-            Lambda(lambda x: crop(x, int(cy+dy)-size//2, int(cx+dx)-size//2, size, size)),
+            # Lambda(lambda x: crop(x, int(cy+dy)-size//2, int(cx+dx)-size//2, size, size)),
             Resize((self.res, self.res))
 
         ])
